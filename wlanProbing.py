@@ -21,7 +21,7 @@ import socket
 import time
 import ubinascii
 import uping
-#import lib.messageQueue
+import messageQueue
 
 
 from umqtt.robust import MQTTClient
@@ -53,9 +53,13 @@ CONFIG = {
     "mqttConfigTopic": "wlanProbe/Config",
     "mqttMeasureTopic": "wlanProbe/Measurement",
     "mqttUser": "wlanprobe",
+    "mqttSendLimit" : 64,
     "wlanSecret": "sehfikowheuirh8923",
     "wlanSsid": "TheInternet",
     }
+
+GLOBAL_MESSAGE_QUEUE = messageQueue.mQ(CONFIG["mqttClientUniqueId"])
+
 
 '''
 Contains previous connection state to differ between disconnection on
@@ -182,11 +186,18 @@ def connectedSchedule(
     ioWlanData.append(generatedMessage)
     ioEventTimer = eventScheduler(ioEventTimer,)
     timeDiff, outNtpResult, ioNtpLastSuccess = setLocalTime(ioNtpLastSuccess)
+
+    # send from new queue
+    ioMqttCounter = mqttSendQueue(CONFIG["mqttBroker"], ioMqttCounter)
+
+    # send from legacy queues
     ioMqttCounter = mqttCommit(ioMqttCounter,
                                CONFIG["mqttBroker"],
                                CONFIG["mqttMeasureTopic"],
                                CONFIG["mqttClientUniqueId"],
                                ioWlanData)
+
+
     ioEventTimer = eventScheduler(ioEventTimer,)
     printDebug("ioConnectTime", ioConnectTime)
     randomDelay = randint(0, CONFIG["maximumRandomSecondsDelay"])
@@ -566,6 +577,65 @@ def mqttCollectMessages(inMqttBroker=CONFIG["mqttBroker"],
         outMqttData.append(errorMessage)
         return outMqttData
 
+'''
+This function sends the queue from GLOBAL_MESSAGE_QUEUE to
+the list inMqttBroker.  It limits itself to CONFIG["mqttBurstSize"],
+if that value is not None.
+'''
+def mqttSendQueue(inMqttBroker,
+                  ioMqttCounter,
+                  inMqttSendLimit = CONFIG['mqttSendLimit']):
+
+    uping.ping(inMqttBroker, 1)
+    topic = CONFIG["mqttMeasureTopic"]
+    msgCount = 0
+
+    mqttClient = MQTTClient(GLOBAL_MESSAGE_QUEUE.uniqueID(),
+                            inMqttBroker,
+                            ssl=CONFIG["mqttSSL"],
+                            user=CONFIG["mqttUser"],
+                            password=CONFIG["mqttPassword"],
+                            )
+    mqttLastWill = ("-1, -1, -1, -1, -1, -1, -1, -1, -1, " +
+                    GLOBAL_MESSAGE_QUEUE.uniqueID() + ", " +
+                    MESSAGE_TYPES["mqttErrorMessage"] + ", " +
+                    "UngracefulDisconnect, " +
+                    "Ungraceful disruption of MQTT commit, "
+                    )
+    printDebug("queue mqttLastWill", mqttLastWill)
+    mqttClient.set_last_will(topic, mqttLastWill)
+
+    try:
+        mqttClient.connect()
+        print("## Connected with MQTT Broker", inMqttBroker)
+        printDataDebug("ioMqttData", ioMqttData)
+
+        while(GLOBAL_MESSAGE_QUEUE.lenQ()[0] > 0 and msgCount < inMqttSendLimit):
+            msg = GLOBAL_MESSAGE_QUEUE.getMsg()
+            mqttClient.publish(topic, json.dumps(msg))
+            msgCount += 1
+            ioMqttCounter += 1
+
+    except Exception as e:
+        sys.print_exception(e)
+        errorMessage = mqttErrorMessage(GLOBAL_MESSAGE_QUEUE.uniqueID(),
+                                        "Exception",
+                                        "MQTTClientConnectError",
+                                        str(e),
+                                        )
+        GLOBAL_MESSAGE_QUEUE.addMsg(errorMessage, "high")
+
+    try:
+        mqttClient.disconnect()
+    except Exception as e:
+        sys.print_exception(e)
+        errorMessage = mqttErrorMessage(GLOBAL_MESSAGE_QUEUE.uniqueID(),
+                                        "Exception",
+                                        "MQTTClientDisconnectError",
+                                        str(e),
+                                        )
+        GLOBAL_MESSAGE_QUEUE.addMsg(errorMessage, "high")
+    return ioMqttCounter
 
 def mqttCommit(ioMqttCounter,
                inMqttBroker,
@@ -791,13 +861,11 @@ def startupSequenz(inNic):
     while not outNtpResult:
         timeDiff, outNtpResult, ioNtpLastSuccess = setLocalTime(-9999)
         eventTimer = eventScheduler(eventTimer,)
-    generatedMessage = generateMessageList(startTime,
-                                           timeDiff,
-                                           CONFIG["mqttClientUniqueId"],
-                                           MESSAGE_TYPES["deviceStart"],
-                                           "Device has been started",
-                                           )
-    outWlanData.append(generatedMessage)
+
+    GLOBAL_MESSAGE_QUEUE.addMsg({"seconds": startTime,
+                                 "messageType" : MESSAGE_TYPES["deviceStart"],
+                                 "messageContent":"Device has been started"})
+
     print("Generate scan messages with timestamp")
     print("MemInfo", micropython.mem_info())
     for scanTime in scanTimeList:

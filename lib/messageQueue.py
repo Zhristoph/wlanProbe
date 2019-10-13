@@ -1,3 +1,5 @@
+import time
+
 class mQ:
 
     def __init__(self, inUniqueID):
@@ -9,6 +11,9 @@ class mQ:
         self._ntpHasBeenSet = False
         self._timeDiff = 0
         self._uniqueID = inUniqueID
+
+    def uniqueID(self):
+        return self._uniqueID
 
     def addMsg(self, inNewMessage, inPriority="low"):
         '''
